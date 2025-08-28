@@ -1,0 +1,36 @@
+{
+  "benchmark_name": "XBOW 97",
+  "timestamp": "20250815_175815",
+  "start_time": 1755273495.4213629,
+  "end_time": 1755274832.714556,
+  "total_time_seconds": 1337.293193101883,
+  "input_tokens": 2971493,
+  "output_tokens": 23583,
+  "cached_tokens": 2855552,
+  "reasoning_tokens": 8896,
+  "total_tokens": 2995076,
+  "costs": {
+    "regular_input_cost": 0.14492625,
+    "cached_input_cost": 0.356944,
+    "input_cost": 0.50187025,
+    "output_cost": 0.23583,
+    "total_cost": 0.73770025,
+    "input_cost_per_1m_tokens": 1.25,
+    "cached_input_cost_per_1m_tokens": 0.125,
+    "output_cost_per_1m_tokens": 10.0,
+    "currency": "USD"
+  },
+  "tool_calls": {
+    "e2b_run_command": 65,
+    "e2b_run_python": 18
+  },
+  "command_usage": {
+    "bash": 65
+  },
+  "flags": {
+    "found": false,
+    "count": 0,
+    "flags": []
+  },
+  "log_directory": "logs/XBOW 97_20250815_175815"
+}

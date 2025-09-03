@@ -1,71 +1,37 @@
 import os
 import json
 import asyncio
-from typing import Any, Dict, Optional, List
-from openai import AsyncAzureOpenAI, AsyncOpenAI
+from typing import Any, Dict, List, Optional
 from datetime import datetime, UTC
 import threading
 import logging
 import importlib
-from agents import function_tool
+from agents import function_tool, Agent, Runner
+from agents.tool import Tool
 import json as json_module
 import httpx
+from env import (
+    setup_agents_config,
+    get_sandbox_factory,
+    get_system_prompt,
+    get_sandbox_system_prompt,
+    get_validator_system_prompt,
+    test_model_warmup_sync,
+)
 
 
 # --- Setup ---
 # client = AsyncOpenAI()
 
 
-def _mandatory(env_var_name: str) -> str:
-    value = os.getenv(env_var_name)
-    if not value:
-        raise ValueError(f"Environment variable {env_var_name} is not set")
-    return value
-
-
-def _optional(env_var_name: str) -> Optional[str]:
-    return os.getenv(env_var_name)
-
-
-def get_client() -> AsyncOpenAI | AsyncAzureOpenAI:
-    azure_endpoint = _optional("AZURE_OPENAI_ENDPOINT")
-    if azure_endpoint:
-        print(f"Using Azure OpenAI endpoint: {azure_endpoint}")
-        return AsyncAzureOpenAI(
-            api_key=_mandatory("AZURE_OPENAI_API_KEY"),
-            api_version=_mandatory("AZURE_API_VERSION"),
-            azure_endpoint=_mandatory("AZURE_OPENAI_ENDPOINT"),
-            azure_deployment=_mandatory("AZURE_OPENAI_DEPLOYMENT"),
-        )
-
-    if os.getenv("OPENAI_API_KEY"):
-        print("Using OpenAI API")
-        return AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-        )
-
-    raise ValueError("No OpenAI API key or Azure OpenAI endpoint provided")
-
-
-def get_model() -> str:
-    azure_model = os.getenv(
-        "AZURE_OPENAI_DEPLOYMENT"
-    )  # WTF WE HAVE TO PUT DEPLOYMENT HERE, NOT MODEL
-    if azure_model:
-        return azure_model
-
-    return "gpt-5"
-
-
-client = get_client()
-model = get_model()
-
-print(f"Using model: {model}")
+# Set up agents configuration from environment
+client, model, run_config = setup_agents_config()
+test_model_warmup_sync(run_config, model)
 
 
 # Global sandbox configuration (sanitized for open release)
 # Provide a factory via env var SANDBOX_FACTORY="your_module:create_sandbox" that returns a sandbox instance
-SANDBOX_FACTORY = os.getenv("SANDBOX_FACTORY", "sandbox:create_sandbox")
+SANDBOX_FACTORY = get_sandbox_factory()
 
 # Thread-local storage for sandbox instances
 _thread_local = threading.local()
@@ -251,33 +217,14 @@ def _log_tool_results(
         )
 
 
-# Create tasks for parallel execution
-async def execute_function_call(function_call):
-    args_raw = getattr(function_call, "arguments", {})
-    if isinstance(args_raw, str):
-        try:
-            function_call_arguments = json.loads(args_raw)
-        except Exception:
-            # If the model already returned a plain string that isn't JSON, wrap it
-            function_call_arguments = {"input": args_raw}
-    elif isinstance(args_raw, dict):
-        function_call_arguments = args_raw
-    else:
-        # Fallback to empty dict
-        function_call_arguments = {}
-
-    logging.info(
-        f"[tool_exec] Preparing to execute function_call name={getattr(function_call, 'name', '')} call_id={getattr(function_call, 'call_id', '')} args={_safe_json_dumps(function_call_arguments)}"
+# Simple helper to create agent with tools
+def create_security_agent(system_prompt: str):
+    """Create a security scanning agent with all the necessary tools."""
+    return Agent(
+        name="SecurityScanner",
+        instructions=system_prompt,
+        tools=tools,
     )
-
-    # Execute the function logic
-    result = await execute_tool(function_call.name, function_call_arguments)
-
-    return {
-        "type": "function_call_output",
-        "call_id": function_call.call_id,
-        "output": result,
-    }
 
 
 # In-memory store: email -> JWT token (for mail.tm API)
@@ -637,8 +584,7 @@ async def send_scan_summary(
     )
 
 
-@function_tool(name_override="sandbox_agent")
-async def run_sandbox_agent(input: str, max_rounds: int = 100):
+async def _run_sandbox_agent_impl(input: str, max_rounds: int = 100):
     """
     Nested agent loop that uses only sandbox execution tools to fulfill the provided instruction.
     Returns the final textual response when the model stops requesting tools or when max_rounds is hit.
@@ -647,90 +593,113 @@ async def run_sandbox_agent(input: str, max_rounds: int = 100):
         instruction: The instruction for the sandbox agent to execute
         max_rounds: Maximum number of execution rounds (default: 100)
     """
-    sandbox_system_prompt = os.getenv(
-        "SANDBOX_SYSTEM_PROMPT",
-        (
-            "You are an agent that autonomously interacts with an isolated sandbox using two tools: "
-            "`sandbox_run_command` (bash) and `sandbox_run_python` (Python). Keep responses within 30,000 "
-            "characters; chunk large outputs. Think step-by-step before taking actions."
-        ),
+    sandbox_system_prompt = get_sandbox_system_prompt()
+
+    logging.info(f"[sandbox_agent] Starting with max_rounds={max_rounds}")
+    logging.info(f"[sandbox_agent] Input length: {len(input)} characters")
+
+    # Create sandbox agent with only the low-level tools
+    sandbox_tools: List[Tool] = [sandbox_run_command, sandbox_run_python]
+    sandbox_agent = Agent(
+        name="SandboxAgent",
+        instructions=sandbox_system_prompt,
+        tools=sandbox_tools,
     )
 
-    sandbox_input_list = [
-        {
-            "role": "developer",
-            "content": [
-                {"type": "input_text", "text": sandbox_system_prompt},
-            ],
-        },
-        {"role": "user", "content": input},
-    ]
+    logging.info(f"[sandbox_agent] Created agent with {len(sandbox_tools)} tools")
 
-    # Restrict to the low-level sandbox tools to avoid recursive nesting
-    sandbox_tools = [
-        t
-        for t in tools
-        if t.get("name") in ("sandbox_run_command", "sandbox_run_python")
-    ]
+    try:
+        # Use the SDK's Runner
+        result = await Runner.run(
+            starting_agent=sandbox_agent,
+            input=input,
+            max_turns=max_rounds,
+            run_config=run_config,
+        )
 
-    # print(f"[debug] Sandbox input list: {sandbox_input_list}")
-
-    rounds_completed = 0
-    while True:
-        logging.info(f"[sandbox_agent] Round {rounds_completed + 1} starting")
-        _log_messages("[sandbox_agent/input]", sandbox_input_list)
-        response = await client.responses.create(
-            model=model,
-            tools=sandbox_tools,
-            input=sandbox_input_list,
-            reasoning={"effort": "high"},
-            extra_body={
-                "metadata": {
-                    "name": "sandbox_agent",
-                }
-            },
-        )  # type: ignore
+        logging.info("[sandbox_agent] Completed successfully")
+        logging.info(
+            f"[sandbox_agent] Output length: {len(result.final_output) if result.final_output else 0} characters"
+        )
 
         # Log sandbox agent usage
         usage_tracker = get_current_usage_tracker()
-        if usage_tracker and hasattr(response, "usage"):
+        if usage_tracker and hasattr(result, "usage"):
             usage_tracker.log_sandbox_agent_usage(
-                response.usage, getattr(_thread_local, "current_target_url", "")
+                result.usage, getattr(_thread_local, "current_target_url", "")
             )
 
-        function_calls = [
-            item for item in response.output if item.type == "function_call"
-        ]
+        return result.final_output
 
-        # print(f"[debug] Function calls: {function_calls}")
+    except Exception as e:
+        logging.error(f"[sandbox_agent] Error during execution: {e}")
+        return f"[sandbox_agent] Error: {e}"
 
-        if not function_calls:
-            output_text = ""
-            for item in response.output:
-                if item.type == "message" and hasattr(item, "content"):
-                    for content_item in item.content:
-                        if hasattr(content_item, "text"):
-                            output_text += content_item.text
-            # print(output_text)
-            logging.info(
-                f"[sandbox_agent] Final text output:\n{_truncate_text(output_text)}"
+
+async def _run_validator_agent_impl(input: str, max_rounds: int = 50):
+    """
+    Agent loop specialized for validating Proofs-of-Concept (PoCs) in the sandbox.
+    Use only sandbox tools, keep outputs concise, and return a clear verdict.
+
+    Args:
+        instruction: Validation instruction that includes the PoC and expected outcome
+        max_rounds: Maximum number of execution rounds (default: 50)
+    """
+    validator_system_prompt = get_validator_system_prompt()
+
+    logging.info(f"[validator_agent] Starting with max_rounds={max_rounds}")
+    logging.info(f"[validator_agent] Input length: {len(input)} characters")
+
+    # Create validator agent with only the low-level tools
+    validator_tools: List[Tool] = [sandbox_run_command, sandbox_run_python]
+    validator_agent = Agent(
+        name="ValidatorAgent",
+        instructions=validator_system_prompt,
+        tools=validator_tools,
+    )
+
+    logging.info(f"[validator_agent] Created agent with {len(validator_tools)} tools")
+
+    try:
+        # Use the SDK's Runner
+        result = await Runner.run(
+            starting_agent=validator_agent,
+            input=input,
+            max_turns=max_rounds,
+            run_config=run_config,
+        )
+
+        logging.info("[validator_agent] Completed successfully")
+        logging.info(
+            f"[validator_agent] Output length: {len(result.final_output) if result.final_output else 0} characters"
+        )
+
+        # Reuse sandbox usage tracker for validator agent
+        usage_tracker = get_current_usage_tracker()
+        if usage_tracker and hasattr(result, "usage"):
+            usage_tracker.log_sandbox_agent_usage(
+                result.usage, getattr(_thread_local, "current_target_url", "")
             )
-            return output_text or ""
 
-        # Record model tool requests and execute them in parallel
-        sandbox_input_list.extend(response.output)
-        _log_function_calls("sandbox_agent", function_calls)
-        tasks = [
-            execute_function_call(function_call) for function_call in function_calls
-        ]
-        results = await asyncio.gather(*tasks)
+        return result.final_output
 
-        sandbox_input_list.extend(results)
-        _log_tool_results("sandbox_agent", results)
-        rounds_completed += 1
+    except Exception as e:
+        logging.error(f"[validator_agent] Error during execution: {e}")
+        return f"[validator_agent] Error: {e}"
 
-        if max_rounds and rounds_completed >= max_rounds:
-            return f"[sandbox_agent] Reached max rounds limit: {max_rounds}"
+
+# Create decorated versions for the tool system
+@function_tool(name_override="sandbox_agent")
+async def run_sandbox_agent(input: str, max_rounds: int = 100):
+    """
+    Nested agent loop that uses only sandbox execution tools to fulfill the provided instruction.
+    Returns the final textual response when the model stops requesting tools or when max_rounds is hit.
+
+    Args:
+        input: The instruction for the sandbox agent to execute
+        max_rounds: Maximum number of execution rounds (default: 100)
+    """
+    return await _run_sandbox_agent_impl(input, max_rounds)
 
 
 @function_tool(name_override="validator_agent")
@@ -740,89 +709,10 @@ async def run_validator_agent(input: str, max_rounds: int = 50):
     Use only sandbox tools, keep outputs concise, and return a clear verdict.
 
     Args:
-        instruction: Validation instruction that includes the PoC and expected outcome
+        input: Validation instruction that includes the PoC and expected outcome
         max_rounds: Maximum number of execution rounds (default: 50)
     """
-    validator_system_prompt = os.getenv(
-        "VALIDATOR_SYSTEM_PROMPT",
-        (
-            "You validate security PoCs inside an isolated sandbox using two tools: "
-            "`sandbox_run_command` (bash) and `sandbox_run_python` (Python). Your goal is to: "
-            "(1) Reproduce the PoC minimally and safely, (2) Capture evidence (stdout, file diffs, HTTP responses), "
-            "(3) Decide if the PoC reliably demonstrates a real vulnerability with impact, (4) Provide a concise verdict. "
-            "Always think step-by-step before actions. Keep outputs within 30,000 characters and chunk large outputs. "
-            "Avoid destructive actions unless explicitly required for validation."
-        ),
-    )
-
-    validator_input_list = [
-        {
-            "role": "developer",
-            "content": [
-                {"type": "input_text", "text": validator_system_prompt},
-            ],
-        },
-        {"role": "user", "content": input},
-    ]
-
-    validator_tools = [
-        t
-        for t in tools
-        if t.get("name") in ("sandbox_run_command", "sandbox_run_python")
-    ]
-
-    rounds_completed = 0
-    while True:
-        logging.info(f"[validator_agent] Round {rounds_completed + 1} starting")
-        _log_messages("[validator_agent/input]", validator_input_list)
-        response = await client.responses.create(
-            model=model,
-            tools=validator_tools,
-            input=validator_input_list,
-            reasoning={"effort": "high"},
-            extra_body={
-                "metadata": {
-                    "name": "validator_agent",
-                }
-            },
-        )  # type: ignore
-
-        # Reuse sandbox usage tracker for validator agent
-        usage_tracker = get_current_usage_tracker()
-        if usage_tracker and hasattr(response, "usage"):
-            usage_tracker.log_sandbox_agent_usage(
-                response.usage, getattr(_thread_local, "current_target_url", "")
-            )
-
-        function_calls = [
-            item for item in response.output if item.type == "function_call"
-        ]
-
-        if not function_calls:
-            output_text = ""
-            for item in response.output:
-                if item.type == "message" and hasattr(item, "content"):
-                    for content_item in item.content:
-                        if hasattr(content_item, "text"):
-                            output_text += content_item.text
-            logging.info(
-                f"[validator_agent] Final text output:\n{_truncate_text(output_text)}"
-            )
-            return output_text or ""
-
-        validator_input_list.extend(response.output)
-        _log_function_calls("validator_agent", function_calls)
-        tasks = [
-            execute_function_call(function_call) for function_call in function_calls
-        ]
-        results = await asyncio.gather(*tasks)
-
-        validator_input_list.extend(results)
-        _log_tool_results("validator_agent", results)
-        rounds_completed += 1
-
-        if max_rounds and rounds_completed >= max_rounds:
-            return f"[validator_agent] Reached max rounds limit: {max_rounds}"
+    return await _run_validator_agent_impl(input, max_rounds)
 
 
 @function_tool
@@ -940,68 +830,18 @@ async def sandbox_run_command(command: str, timeout: int = 120):
         return f"Failed to run command in sandbox: {e}"
 
 
-# Collect all function tools that were decorated
-_function_tools = {
-    "sandbox_run_command": sandbox_run_command,
-    "sandbox_run_python": sandbox_run_python,
-    "sandbox_agent": run_sandbox_agent,
-    "validator_agent": run_validator_agent,
-    "get_message_by_id": get_message_by_id,
-    "list_account_messages": list_account_messages,
-    "get_registered_emails": get_registered_emails,
-    "send_security_alert": send_security_alert,
-    "send_scan_summary": send_scan_summary,
-}
-
-
-async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
-    try:
-        if name in _function_tools:
-            func_tool = _function_tools[name]
-            logging.info(
-                f"[tool_exec] Executing tool name={name} args={_safe_json_dumps(arguments)}"
-            )
-            out = await func_tool.on_invoke_tool(**arguments)  # type: ignore
-        else:
-            out = {"error": f"Unknown tool: {name}", "args": arguments}
-    except Exception as e:
-        out = {"error": str(e), "args": arguments}
-
-    # Ensure we return a plain string for tool output; JSON-encode only non-strings
-    if isinstance(out, str):
-        logging.info(f"[tool_exec] Tool name={name} returned string length={len(out)}")
-        return out
-
-    out_json = json.dumps(out)
-    logging.info(f"[tool_exec] Tool name={name} returned json length={len(out_json)}")
-    return out_json
-
-
-def generate_tools_from_function_tools():
-    """Auto-generate tools list from decorated functions."""
-    tools = []
-
-    for _, func_tool in _function_tools.items():
-        # Each function tool should have the FunctionTool attributes
-        if (
-            hasattr(func_tool, "name")
-            and hasattr(func_tool, "description")
-            and hasattr(func_tool, "params_json_schema")
-        ):
-            tool_def = {
-                "type": "function",
-                "name": func_tool.name,
-                "description": func_tool.description,
-                "parameters": func_tool.params_json_schema,
-                "strict": getattr(func_tool, "strict_json_schema", True),
-            }
-            tools.append(tool_def)
-
-    return tools
-
-
-# Generate tools automatically from decorated functions
-tools = generate_tools_from_function_tools()
+# Collect all function tools for the agent
+tools: List[Tool] = [
+    sandbox_run_command,
+    sandbox_run_python,
+    run_sandbox_agent,
+    run_validator_agent,
+    get_message_by_id,
+    list_account_messages,
+    get_registered_emails,
+    send_security_alert,
+    send_scan_summary,
+]
 
 
 user_prompt = """i need you to come up with detailed poc for the workflow code injection vulnerability
@@ -1055,110 +895,63 @@ async def run_continuously(
     # Set target URL for usage tracking
     _thread_local.current_target_url = target_url
 
-    rounds_completed = 0
+    # Create usage tracker
+    usage_tracker = get_current_usage_tracker()
 
-    input_list = [
-        {
-            "role": "developer",
-            "content": [{"type": "input_text", "text": system_prompt}],
-        },
-        {
-            "role": "user",
-            "content": user_prompt,
-        },
-    ]
-
-    main_agent_tools = [
-        t
-        for t in tools
-        if t.get("name")
-        in (
-            "sandbox_agent",
-            "validator_agent",
-            "get_message_by_id",
-            "list_account_messages",
-            "get_registered_emails",
-            "send_security_alert",
-            "send_scan_summary",
-        )
-    ]
-
-    # Extract site name from URL for metadata
+    # Extract site name from URL for metadata (used for logging context)
     site_name = (
         target_url.replace("https://", "").replace("http://", "").split("/")[0]
         if target_url
         else "unknown"
     )
+    logging.info(f"[main_agent] Site: {site_name}")
 
     try:
-        while True:
-            # 1) Ask the model what to do next
-            logging.info(f"[main_agent] Round {rounds_completed + 1} starting")
-            _log_messages("[main_agent/input]", input_list)
-            response = await client.responses.create(
-                model=model,
-                tools=main_agent_tools,
-                input=input_list,
-                reasoning={"effort": "high"},
-                extra_body={
-                    "metadata": {
-                        "name": "security_scan",
-                        "site_name": site_name,
-                        "target_url": target_url,
-                    }
-                },
-            )  # type: ignore
+        logging.info(f"[main_agent] Starting security scan for {target_url}")
+        logging.info(f"[main_agent] Max rounds: {max_rounds}")
 
-            # Log main agent usage
-            usage_tracker = get_current_usage_tracker()
-            if usage_tracker and hasattr(response, "usage"):
-                usage_tracker.log_main_agent_usage(response.usage, target_url)
+        # Create agent and run using the SDK
+        agent = create_security_agent(system_prompt)
 
-            # 2) Check for function calls
-            function_calls = [
-                item for item in response.output if item.type == "function_call"
-            ]
+        # Log agent details
+        logging.info(f"[main_agent] Created agent with {len(agent.tools)} tools")
+        logging.info(f"[main_agent] Tools: {[tool.name for tool in agent.tools]}")
 
-            # If there are no tool calls, print whatever the model returned and stop
-            if not function_calls:
-                output_text = ""
-                for item in response.output:
-                    if item.type == "message" and hasattr(item, "content"):
-                        for content_item in item.content:
-                            if hasattr(content_item, "text"):
-                                output_text += content_item.text
-                        break
-                print(output_text)
-                print(response.id)
-                logging.info(
-                    f"[main_agent] Final text output id={response.id}:\n{_truncate_text(output_text)}"
-                )
-                return output_text
+        # Use the SDK's Runner to handle everything
+        logging.info(f"[main_agent] Starting Runner.run with max_turns={max_rounds}")
+        result = await Runner.run(
+            starting_agent=agent,
+            input=user_prompt,
+            max_turns=max_rounds,
+            run_config=run_config,
+        )
 
-            # 3) Record the function calls in the conversation and execute them in parallel
-            input_list.extend(response.output)
-            _log_function_calls("main_agent", function_calls)
-            print(
-                f"[debug] Executing {len(function_calls)} function calls in parallel..."
-            )
+        # Log completion
+        logging.info("[main_agent] Runner completed successfully")
+        logging.info(
+            f"[main_agent] Final output length: {len(result.final_output) if result.final_output else 0} characters"
+        )
 
-            tasks = [
-                execute_function_call(function_call) for function_call in function_calls
-            ]
-            results = await asyncio.gather(*tasks)
+        # Log usage if available
+        if usage_tracker and hasattr(result, "usage"):
+            usage_tracker.log_main_agent_usage(result.usage, target_url)
+            logging.info(f"[main_agent] Usage logged for target: {target_url}")
 
-            # 4) Add tool results for the next round
-            input_list.extend(results)
-            _log_tool_results("main_agent", results)
-            rounds_completed += 1
+        # Print final output to console
+        print(result.final_output)
+        if hasattr(result, "response_id"):
+            print(f"Response ID: {result.response_id}")
 
-            # 5) Safety valve for infinite loops
-            if max_rounds and rounds_completed >= max_rounds:
-                print(f"[debug] Reached max rounds limit: {max_rounds}")
-                break
+        return result.final_output
+
+    except Exception as e:
+        logging.error(f"[main_agent] Error during execution: {e}")
+        raise
+
     finally:
         # Kill the sandbox when scan is done
         if sandbox_instance and hasattr(sandbox_instance, "kill"):
+            logging.info("[main_agent] Cleaning up sandbox instance")
             sandbox_instance.kill()
 
 
@@ -1299,14 +1092,7 @@ if __name__ == "__main__":
         handlers=[logging.FileHandler("scan_usage.log"), logging.StreamHandler()],
     )
 
-    system_prompt = os.getenv(
-        "SYSTEM_PROMPT",
-        """You are a security oracle, you are given a target URL and you need to scan it for vulnerabilities, you must critically analyse the code and identify every single vulnerability, for identified vulnerabilities a PoC must be provided, focus on critical vulnerabilities, i m only insterested in real world vulnerabilities, not theoretical ones. You are not allowed to go out of scope, you must scan the whole domain, and you must return a detailed report of the vulnerabilities found.
-        You must plan orchestrate the scan, and use tools to acutally perform actions, via sandboxed agents. Start sandboxed agents to send, requests, run commands, etc.
-        Then use the result to plan the next steps, and iterate.
-        Use the tools to report the vulnerabilities found.
-        """,
-    )
+    system_prompt = get_system_prompt()
 
     # Check if targets.txt file exists in current directory
     targets_file = "targets.txt"

@@ -7,13 +7,11 @@ of commands and Python code during vulnerability scanning.
 """
 
 import os
-import tempfile
 import subprocess
 import time
 import logging
-from typing import Optional, Any, Dict
+from typing import Optional
 from dataclasses import dataclass
-from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -80,9 +78,9 @@ class DockerSandbox:
                 "1",  # CPU limit
                 "--read-only",  # Read-only root filesystem
                 "--tmpfs",
-                "/tmp",  # Temporary filesystem
+                "/tmp:rw,mode=1777",  # Temporary filesystem writable for all users
                 "--tmpfs",
-                self.working_dir,  # Working directory as tmpfs
+                f"{self.working_dir}:rw,uid=1000,gid=1000,mode=0775",  # Working directory as tmpfs owned by 'user'
                 self.image_name,
                 "sleep",
                 "infinity",  # Keep container running
@@ -101,7 +99,6 @@ class DockerSandbox:
 
                 # Set up the working directory
                 self._run_docker_command(["mkdir", "-p", self.working_dir])
-                self._run_docker_command(["chmod", "755", self.working_dir])
 
             except subprocess.TimeoutExpired:
                 raise RuntimeError("Timeout starting Docker container")
@@ -178,50 +175,49 @@ class DockerSandbox:
                 path: Path to the file (relative to sandbox working directory)
                 content: Content to write
             """
-            # Create a temporary file on host
-            with tempfile.NamedTemporaryFile(
-                mode="w", delete=False, suffix=".tmp"
-            ) as tmp_file:
-                tmp_file.write(content)
-                tmp_file_path = tmp_file.name
+            # Ensure container is up
+            self.sandbox._ensure_container_running()
 
-            try:
-                # Copy file to container
-                container_path = (
-                    path
-                    if path.startswith("/")
-                    else f"{self.sandbox.working_dir}/{path}"
+            # Determine absolute path inside container
+            container_path = (
+                path if path.startswith("/") else f"{self.sandbox.working_dir}/{path}"
+            )
+
+            # Ensure directory exists
+            dir_path = os.path.dirname(container_path)
+            if dir_path and dir_path != "/":
+                self.sandbox._run_docker_command(["mkdir", "-p", dir_path])
+
+            # Stream content into the container using docker exec with stdin to avoid
+            # docker cp failures on read-only rootfs; tmpfs at working_dir is writable
+            if not self.sandbox.container_id:
+                raise RuntimeError("Container not started")
+
+            exec_cmd = [
+                "docker",
+                "exec",
+                "-i",
+                "-u",
+                "user",
+                self.sandbox.container_id,
+                "sh",
+                "-c",
+                f"cat > '{container_path}'",
+            ]
+            result = subprocess.run(
+                exec_cmd,
+                input=content,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to write file in container: {result.stderr}"
                 )
 
-                # Ensure directory exists
-                dir_path = os.path.dirname(container_path)
-                if dir_path and dir_path != "/":
-                    self.sandbox._run_docker_command(["mkdir", "-p", dir_path])
-
-                # Copy the file
-                copy_cmd = [
-                    "docker",
-                    "cp",
-                    tmp_file_path,
-                    f"{self.sandbox.container_name}:{container_path}",
-                ]
-                result = subprocess.run(
-                    copy_cmd, capture_output=True, text=True, timeout=10
-                )
-
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"Failed to copy file to container: {result.stderr}"
-                    )
-
-                logger.info(f"Wrote {len(content)} bytes to {container_path}")
-
-            finally:
-                # Clean up temporary file
-                try:
-                    os.unlink(tmp_file_path)
-                except:
-                    pass
+            logger.info(f"Wrote {len(content)} bytes to {container_path}")
 
     class _Commands:
         """Command execution within the sandbox."""

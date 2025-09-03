@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 from typing import Any, Dict, Optional, List
-from openai import AsyncOpenAI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 from datetime import datetime, UTC
 import threading
 import logging
@@ -13,7 +13,38 @@ import httpx
 
 
 # --- Setup ---
-client = AsyncOpenAI()
+# client = AsyncOpenAI()
+
+
+def get_client() -> AsyncOpenAI | AsyncAzureOpenAI:
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    if azure_endpoint:
+        return AsyncAzureOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            api_version="2024-07-01-preview",
+            azure_endpoint=azure_endpoint,  # type: ignore
+        )
+
+    if os.getenv("OPENAI_API_KEY"):
+        return AsyncOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+        )
+
+    raise ValueError("No OpenAI API key or Azure OpenAI endpoint provided")
+
+
+def get_model() -> str:
+    azure_model = os.getenv("AZURE_OPENAI_MODEL")
+    if azure_model:
+        return azure_model  # type: ignore
+
+    return "gpt-5"
+
+
+client = get_client()
+model = get_model()
+
+print(f"Using model: {model}")
 
 
 # Global sandbox configuration (sanitized for open release)
@@ -540,7 +571,7 @@ async def run_sandbox_agent(instruction: str, max_rounds: int = 100):
     rounds_completed = 0
     while True:
         response = await client.responses.create(
-            model="gpt-5",
+            model=model,
             tools=sandbox_tools,
             input=sandbox_input_list,
             reasoning={"effort": "high"},
@@ -629,7 +660,7 @@ async def run_validator_agent(instruction: str, max_rounds: int = 50):
     rounds_completed = 0
     while True:
         response = await client.responses.create(
-            model="gpt-5",
+            model=model,
             tools=validator_tools,
             input=validator_input_list,
             reasoning={"effort": "high"},
@@ -937,7 +968,7 @@ async def run_continuously(
         while True:
             # 1) Ask the model what to do next
             response = await client.responses.create(
-                model="gpt-5",
+                model=model,
                 tools=main_agent_tools,
                 input=input_list,
                 reasoning={"effort": "high"},

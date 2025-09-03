@@ -177,7 +177,18 @@ def set_current_usage_tracker(tracker):
 
 # Create tasks for parallel execution
 async def execute_function_call(function_call):
-    function_call_arguments = json.loads(function_call.arguments)
+    args_raw = getattr(function_call, "arguments", {})
+    if isinstance(args_raw, str):
+        try:
+            function_call_arguments = json.loads(args_raw)
+        except Exception:
+            # If the model already returned a plain string that isn't JSON, wrap it
+            function_call_arguments = {"input": args_raw}
+    elif isinstance(args_raw, dict):
+        function_call_arguments = args_raw
+    else:
+        # Fallback to empty dict
+        function_call_arguments = {}
 
     # Execute the function logic
     result = await execute_tool(function_call.name, function_call_arguments)
@@ -547,7 +558,7 @@ async def send_scan_summary(
 
 
 @function_tool(name_override="sandbox_agent")
-async def run_sandbox_agent(instruction: str, max_rounds: int = 100):
+async def run_sandbox_agent(input: str, max_rounds: int = 100):
     """
     Nested agent loop that uses only sandbox execution tools to fulfill the provided instruction.
     Returns the final textual response when the model stops requesting tools or when max_rounds is hit.
@@ -572,7 +583,7 @@ async def run_sandbox_agent(instruction: str, max_rounds: int = 100):
                 {"type": "input_text", "text": sandbox_system_prompt},
             ],
         },
-        {"role": "user", "content": instruction},
+        {"role": "user", "content": input},
     ]
 
     # Restrict to the low-level sandbox tools to avoid recursive nesting
@@ -636,7 +647,7 @@ async def run_sandbox_agent(instruction: str, max_rounds: int = 100):
 
 
 @function_tool(name_override="validator_agent")
-async def run_validator_agent(instruction: str, max_rounds: int = 50):
+async def run_validator_agent(input: str, max_rounds: int = 50):
     """
     Agent loop specialized for validating Proofs-of-Concept (PoCs) in the sandbox.
     Use only sandbox tools, keep outputs concise, and return a clear verdict.
@@ -664,7 +675,7 @@ async def run_validator_agent(instruction: str, max_rounds: int = 50):
                 {"type": "input_text", "text": validator_system_prompt},
             ],
         },
-        {"role": "user", "content": instruction},
+        {"role": "user", "content": input},
     ]
 
     validator_tools = [
@@ -853,17 +864,15 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
     try:
         if name in _function_tools:
             func_tool = _function_tools[name]
-            if name == "sandbox_agent":
-                # Handle legacy 'input' parameter or new 'instruction' parameter
-                instruction = arguments.get("instruction", arguments.get("input", ""))
-                max_rounds = arguments.get("max_rounds", 100)
-                out = await func_tool.on_invoke_tool(instruction, max_rounds)
-            else:
-                out = await func_tool.on_invoke_tool(**arguments)  # type: ignore
+            out = await func_tool.on_invoke_tool(**arguments)  # type: ignore
         else:
             out = {"error": f"Unknown tool: {name}", "args": arguments}
     except Exception as e:
         out = {"error": str(e), "args": arguments}
+
+    # Ensure we return a plain string for tool output; JSON-encode only non-strings
+    if isinstance(out, str):
+        return out
     return json.dumps(out)
 
 

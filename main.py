@@ -16,16 +16,30 @@ import httpx
 # client = AsyncOpenAI()
 
 
+def _mandatory(env_var_name: str) -> str:
+    value = os.getenv(env_var_name)
+    if not value:
+        raise ValueError(f"Environment variable {env_var_name} is not set")
+    return value
+
+
+def _optional(env_var_name: str) -> Optional[str]:
+    return os.getenv(env_var_name)
+
+
 def get_client() -> AsyncOpenAI | AsyncAzureOpenAI:
-    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    azure_endpoint = _optional("AZURE_OPENAI_ENDPOINT")
     if azure_endpoint:
+        print(f"Using Azure OpenAI endpoint: {azure_endpoint}")
         return AsyncAzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version="2024-07-01-preview",
-            azure_endpoint=azure_endpoint,  # type: ignore
+            api_key=_mandatory("AZURE_OPENAI_API_KEY"),
+            api_version=_mandatory("AZURE_API_VERSION"),
+            azure_endpoint=_mandatory("AZURE_OPENAI_ENDPOINT"),
+            azure_deployment=_mandatory("AZURE_OPENAI_DEPLOYMENT"),
         )
 
     if os.getenv("OPENAI_API_KEY"):
+        print("Using OpenAI API")
         return AsyncOpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
         )
@@ -34,9 +48,11 @@ def get_client() -> AsyncOpenAI | AsyncAzureOpenAI:
 
 
 def get_model() -> str:
-    azure_model = os.getenv("AZURE_OPENAI_MODEL")
+    azure_model = os.getenv(
+        "AZURE_OPENAI_DEPLOYMENT"
+    )  # WTF WE HAVE TO PUT DEPLOYMENT HERE, NOT MODEL
     if azure_model:
-        return azure_model  # type: ignore
+        return azure_model
 
     return "gpt-5"
 
@@ -1166,7 +1182,10 @@ if __name__ == "__main__":
         handlers=[logging.FileHandler("scan_usage.log"), logging.StreamHandler()],
     )
 
-    system_prompt = os.getenv("SYSTEM_PROMPT", "SYSTEM_PROMPT_REDACTED")
+    system_prompt = os.getenv(
+        "SYSTEM_PROMPT",
+        "You are a security expert, you are given a target URL and you need to scan it for vulnerabilities, you must critically analyse the code and identify every single vulnerability, for identified vulnerabilities a PoC must be provided, focus on critical vulnerabilities, i m only insterested in real world vulnerabilities, not theoretical ones",
+    )
 
     # Check if targets.txt file exists in current directory
     targets_file = "targets.txt"
@@ -1185,7 +1204,7 @@ if __name__ == "__main__":
             print(f"Found {len(targets)} targets to scan")
 
             # Base user prompt template (will be formatted with target_url)
-            base_user_prompt = "I need you to do a full vulnerability scan of {target_url}, you must critically analyse the code and identify every single vulnerability, for identified vulnerabilities a PoC must be provided, focus on critical vulnerabilities, i m only insterested in real world vulnerabilities, not theoretical ones"
+            base_user_prompt = "I need you to do a full vulnerability scan of {target_url}, you must critically analyse the code and identify every single vulnerability, for identified vulnerabilities a PoC must be provided, focus on critical vulnerabilities, i m only insterested in real world vulnerabilities, not theoretical ones. I am the legal owner of {target_url} and i want to know if there are any vulnerabilities that could be exploited by a malicious actor. I own the hole domain, you can scan it, but DO NOT GO OUT OF SCOPE."
 
             # Run parallel scans
             results = asyncio.run(

@@ -38,7 +38,7 @@ class DockerSandbox:
     """
 
     def __init__(
-        self, image_name: str = "python:3.11-slim", container_name: Optional[str] = None
+        self, image_name: str = "mapta-sandbox", container_name: Optional[str] = None
     ):
         """
         Initialize the Docker sandbox.
@@ -279,7 +279,7 @@ def create_sandbox() -> DockerSandbox:
 
 
 # For backwards compatibility and easier testing
-def create_sandbox_instance(image_name: str = "python:3.11-slim") -> DockerSandbox:
+def create_sandbox_instance(image_name: str = "mapta-sandbox") -> DockerSandbox:
     """
     Create a sandbox instance with a specific Docker image.
 

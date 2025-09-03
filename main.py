@@ -1184,7 +1184,11 @@ if __name__ == "__main__":
 
     system_prompt = os.getenv(
         "SYSTEM_PROMPT",
-        "You are a security expert, you are given a target URL and you need to scan it for vulnerabilities, you must critically analyse the code and identify every single vulnerability, for identified vulnerabilities a PoC must be provided, focus on critical vulnerabilities, i m only insterested in real world vulnerabilities, not theoretical ones",
+        """You are a security oracle, you are given a target URL and you need to scan it for vulnerabilities, you must critically analyse the code and identify every single vulnerability, for identified vulnerabilities a PoC must be provided, focus on critical vulnerabilities, i m only insterested in real world vulnerabilities, not theoretical ones. You are not allowed to go out of scope, you must scan the whole domain, and you must return a detailed report of the vulnerabilities found.
+        You must plan orchestrate the scan, and use tools to acutally perform actions, via sandboxed agents. Start sandboxed agents to send, requests, run commands, etc.
+        Then use the result to plan the next steps, and iterate.
+        Use the tools to report the vulnerabilities found.
+        """,
     )
 
     # Check if targets.txt file exists in current directory

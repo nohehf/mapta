@@ -10,6 +10,7 @@ from agents import function_tool, Agent, Runner
 from agents.tool import Tool
 import json as json_module
 import httpx
+from simple_logger import get_security_hooks, log_vulnerability, save_session_summary
 from env import (
     setup_agents_config,
     get_sandbox_factory,
@@ -448,6 +449,15 @@ async def send_security_alert(
         f"Target: {target_url}, Description: {description[:100]}..."
     )
 
+    # Simple vulnerability logging
+    log_vulnerability(
+        vulnerability_type=vulnerability_type,
+        severity=severity,
+        description=description,
+        poc_code=evidence,
+        agent_name="SecurityScanner",
+    )
+
     # Return structured response for compatibility
     return json_module.dumps(
         {
@@ -609,12 +619,14 @@ async def _run_sandbox_agent_impl(input: str, max_rounds: int = 100):
     logging.info(f"[sandbox_agent] Created agent with {len(sandbox_tools)} tools")
 
     try:
-        # Use the SDK's Runner
+        # Use the SDK's Runner with hooks
+        hooks = get_security_hooks(getattr(_thread_local, "current_target_url", None))
         result = await Runner.run(
             starting_agent=sandbox_agent,
             input=input,
             max_turns=max_rounds,
             run_config=run_config,
+            hooks=hooks,
         )
 
         logging.info("[sandbox_agent] Completed successfully")
@@ -625,9 +637,8 @@ async def _run_sandbox_agent_impl(input: str, max_rounds: int = 100):
         # Log sandbox agent usage
         usage_tracker = get_current_usage_tracker()
         if usage_tracker and hasattr(result, "usage"):
-            usage_tracker.log_sandbox_agent_usage(
-                result.usage, getattr(_thread_local, "current_target_url", "")
-            )
+            target_url = getattr(_thread_local, "current_target_url", "")
+            usage_tracker.log_sandbox_agent_usage(result.usage, target_url)
 
         return result.final_output
 
@@ -661,12 +672,14 @@ async def _run_validator_agent_impl(input: str, max_rounds: int = 50):
     logging.info(f"[validator_agent] Created agent with {len(validator_tools)} tools")
 
     try:
-        # Use the SDK's Runner
+        # Use the SDK's Runner with hooks
+        hooks = get_security_hooks(getattr(_thread_local, "current_target_url", None))
         result = await Runner.run(
             starting_agent=validator_agent,
             input=input,
             max_turns=max_rounds,
             run_config=run_config,
+            hooks=hooks,
         )
 
         logging.info("[validator_agent] Completed successfully")
@@ -677,9 +690,8 @@ async def _run_validator_agent_impl(input: str, max_rounds: int = 50):
         # Reuse sandbox usage tracker for validator agent
         usage_tracker = get_current_usage_tracker()
         if usage_tracker and hasattr(result, "usage"):
-            usage_tracker.log_sandbox_agent_usage(
-                result.usage, getattr(_thread_local, "current_target_url", "")
-            )
+            target_url = getattr(_thread_local, "current_target_url", "")
+            usage_tracker.log_sandbox_agent_usage(result.usage, target_url)
 
         return result.final_output
 
@@ -917,13 +929,15 @@ async def run_continuously(
         logging.info(f"[main_agent] Created agent with {len(agent.tools)} tools")
         logging.info(f"[main_agent] Tools: {[tool.name for tool in agent.tools]}")
 
-        # Use the SDK's Runner to handle everything
+        # Use the SDK's Runner to handle everything with hooks
+        hooks = get_security_hooks(target_url)
         logging.info(f"[main_agent] Starting Runner.run with max_turns={max_rounds}")
         result = await Runner.run(
             starting_agent=agent,
             input=user_prompt,
             max_turns=max_rounds,
             run_config=run_config,
+            hooks=hooks,
         )
 
         # Log completion
@@ -1119,4 +1133,9 @@ if __name__ == "__main__":
             )
 
             print("\nAll scans completed!")
+
+            # Save session summary
+            summary_file = save_session_summary()
+            print(f"📊 Session summary saved to: {summary_file}")
+
             sys.exit(0)

@@ -72,12 +72,12 @@ class DockerSandbox:
                 "--rm",
                 "--name",
                 self.container_name,
-                "--network",
-                "none",  # Isolated network
+                # "--network",
+                # "none",  # Isolated network
                 "--memory",
-                "512m",  # Memory limit
+                "1024m",  # Memory limit
                 "--cpus",
-                "0.5",  # CPU limit
+                "1",  # CPU limit
                 "--read-only",  # Read-only root filesystem
                 "--tmpfs",
                 "/tmp",  # Temporary filesystem
@@ -112,6 +112,8 @@ class DockerSandbox:
         self, command: list, timeout: Optional[int] = None
     ) -> CommandResult:
         """Run a command inside the Docker container."""
+
+        self._ensure_container_running()
         if self.container_id is None:
             raise RuntimeError("Container not started")
 

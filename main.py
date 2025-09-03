@@ -175,6 +175,82 @@ def set_current_usage_tracker(tracker):
     _thread_local.usage_tracker = tracker
 
 
+# ---- Logging helpers ----
+def _truncate_text(text: Any, max_chars: int = 4000) -> str:
+    try:
+        s = str(text)
+    except Exception:
+        s = repr(text)
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"...[+{len(s) - max_chars} chars]"
+
+
+def _safe_json_dumps(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return _truncate_text(obj)
+
+
+def _log_messages(tag: str, messages: List[Any], max_chars: int = 2000) -> None:
+    logging.info(f"{tag} messages count: {len(messages)}")
+    for idx, m in enumerate(messages):
+        role = ""
+        content = None
+        if isinstance(m, dict):
+            role = m.get("role", "")
+            content = m.get("content")
+        else:
+            role = getattr(m, "role", "")
+            content = getattr(m, "content", None)
+
+        text_accum = []
+        if isinstance(content, list):
+            for ci in content:
+                if isinstance(ci, dict) and "text" in ci:
+                    text_accum.append(str(ci.get("text", "")))
+                else:
+                    text_accum.append(str(ci))
+        else:
+            if content is not None:
+                text_accum.append(str(content))
+
+        text_joined = _truncate_text("\n".join(text_accum), max_chars)
+        logging.info(f"{tag} [{idx}] role={role} text=\n{text_joined}")
+
+
+def _log_function_calls(
+    agent_name: str, function_calls: List[Any], max_chars: int = 2000
+) -> None:
+    if not function_calls:
+        return
+    logging.info(f"[{agent_name}] Requested {len(function_calls)} tool calls")
+    for fc in function_calls:
+        name = getattr(fc, "name", "")
+        call_id = getattr(fc, "call_id", "")
+        args_raw = getattr(fc, "arguments", "")
+        args_display = _truncate_text(args_raw, max_chars)
+        logging.info(
+            f"[{agent_name}] -> function_call name={name} call_id={call_id} args={args_display}"
+        )
+
+
+def _log_tool_results(
+    agent_name: str, results: List[Dict[str, Any]], max_chars: int = 4000
+) -> None:
+    if not results:
+        return
+    logging.info(f"[{agent_name}] Received {len(results)} tool results")
+    for res in results:
+        call_id = res.get("call_id", "")
+        output = res.get("output", "")
+        output_display = _truncate_text(output, max_chars)
+        logging.info(
+            f"[{agent_name}] <- function_result call_id={call_id} output=\n{output_display}"
+        )
+
+
 # Create tasks for parallel execution
 async def execute_function_call(function_call):
     args_raw = getattr(function_call, "arguments", {})
@@ -189,6 +265,10 @@ async def execute_function_call(function_call):
     else:
         # Fallback to empty dict
         function_call_arguments = {}
+
+    logging.info(
+        f"[tool_exec] Preparing to execute function_call name={getattr(function_call, 'name', '')} call_id={getattr(function_call, 'call_id', '')} args={_safe_json_dumps(function_call_arguments)}"
+    )
 
     # Execute the function logic
     result = await execute_tool(function_call.name, function_call_arguments)
@@ -597,6 +677,8 @@ async def run_sandbox_agent(input: str, max_rounds: int = 100):
 
     rounds_completed = 0
     while True:
+        logging.info(f"[sandbox_agent] Round {rounds_completed + 1} starting")
+        _log_messages("[sandbox_agent/input]", sandbox_input_list)
         response = await client.responses.create(
             model=model,
             tools=sandbox_tools,
@@ -630,16 +712,21 @@ async def run_sandbox_agent(input: str, max_rounds: int = 100):
                         if hasattr(content_item, "text"):
                             output_text += content_item.text
             # print(output_text)
+            logging.info(
+                f"[sandbox_agent] Final text output:\n{_truncate_text(output_text)}"
+            )
             return output_text or ""
 
         # Record model tool requests and execute them in parallel
         sandbox_input_list.extend(response.output)
+        _log_function_calls("sandbox_agent", function_calls)
         tasks = [
             execute_function_call(function_call) for function_call in function_calls
         ]
         results = await asyncio.gather(*tasks)
 
         sandbox_input_list.extend(results)
+        _log_tool_results("sandbox_agent", results)
         rounds_completed += 1
 
         if max_rounds and rounds_completed >= max_rounds:
@@ -686,6 +773,8 @@ async def run_validator_agent(input: str, max_rounds: int = 50):
 
     rounds_completed = 0
     while True:
+        logging.info(f"[validator_agent] Round {rounds_completed + 1} starting")
+        _log_messages("[validator_agent/input]", validator_input_list)
         response = await client.responses.create(
             model=model,
             tools=validator_tools,
@@ -716,15 +805,20 @@ async def run_validator_agent(input: str, max_rounds: int = 50):
                     for content_item in item.content:
                         if hasattr(content_item, "text"):
                             output_text += content_item.text
+            logging.info(
+                f"[validator_agent] Final text output:\n{_truncate_text(output_text)}"
+            )
             return output_text or ""
 
         validator_input_list.extend(response.output)
+        _log_function_calls("validator_agent", function_calls)
         tasks = [
             execute_function_call(function_call) for function_call in function_calls
         ]
         results = await asyncio.gather(*tasks)
 
         validator_input_list.extend(results)
+        _log_tool_results("validator_agent", results)
         rounds_completed += 1
 
         if max_rounds and rounds_completed >= max_rounds:
@@ -864,6 +958,9 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
     try:
         if name in _function_tools:
             func_tool = _function_tools[name]
+            logging.info(
+                f"[tool_exec] Executing tool name={name} args={_safe_json_dumps(arguments)}"
+            )
             out = await func_tool.on_invoke_tool(**arguments)  # type: ignore
         else:
             out = {"error": f"Unknown tool: {name}", "args": arguments}
@@ -872,8 +969,12 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> str:
 
     # Ensure we return a plain string for tool output; JSON-encode only non-strings
     if isinstance(out, str):
+        logging.info(f"[tool_exec] Tool name={name} returned string length={len(out)}")
         return out
-    return json.dumps(out)
+
+    out_json = json.dumps(out)
+    logging.info(f"[tool_exec] Tool name={name} returned json length={len(out_json)}")
+    return out_json
 
 
 def generate_tools_from_function_tools():
@@ -992,6 +1093,8 @@ async def run_continuously(
     try:
         while True:
             # 1) Ask the model what to do next
+            logging.info(f"[main_agent] Round {rounds_completed + 1} starting")
+            _log_messages("[main_agent/input]", input_list)
             response = await client.responses.create(
                 model=model,
                 tools=main_agent_tools,
@@ -1027,10 +1130,14 @@ async def run_continuously(
                         break
                 print(output_text)
                 print(response.id)
+                logging.info(
+                    f"[main_agent] Final text output id={response.id}:\n{_truncate_text(output_text)}"
+                )
                 return output_text
 
             # 3) Record the function calls in the conversation and execute them in parallel
             input_list.extend(response.output)
+            _log_function_calls("main_agent", function_calls)
             print(
                 f"[debug] Executing {len(function_calls)} function calls in parallel..."
             )
@@ -1042,6 +1149,7 @@ async def run_continuously(
 
             # 4) Add tool results for the next round
             input_list.extend(results)
+            _log_tool_results("main_agent", results)
             rounds_completed += 1
 
             # 5) Safety valve for infinite loops

@@ -1,25 +1,27 @@
-import os
-import json
 import asyncio
-from typing import Any, Dict, List, Optional
-from datetime import datetime, UTC
-import threading
-import logging
 import importlib
-from agents import function_tool, Agent, Runner
-from agents.tool import Tool
+import json
 import json as json_module
+import logging
+import os
+import threading
+from datetime import UTC, datetime
+from typing import Any, Dict, List, Optional
+
 import httpx
-from simple_logger import get_security_hooks, log_vulnerability, save_session_summary
+from agents import Agent, Runner, function_tool
+from agents.tool import Tool
+
 from env import (
-    setup_agents_config,
     get_sandbox_factory,
-    get_system_prompt,
     get_sandbox_system_prompt,
+    get_system_prompt,
     get_validator_system_prompt,
+    setup_agents_config,
     test_model_warmup_sync,
 )
-
+from simple_logger import get_security_hooks, log_vulnerability, save_session_summary
+from simple_mcp import create_playwright_mcp_server
 
 # --- Setup ---
 # client = AsyncOpenAI()
@@ -27,7 +29,10 @@ from env import (
 
 # Set up agents configuration from environment
 client, model, run_config = setup_agents_config()
-test_model_warmup_sync(run_config, model)
+
+# Only run model warmup when executed directly, not when imported as a module
+if __name__ == "__main__":
+    test_model_warmup_sync(run_config, model)
 
 
 # Global sandbox configuration (sanitized for open release)
@@ -221,10 +226,15 @@ def _log_tool_results(
 # Simple helper to create agent with tools
 def create_security_agent(system_prompt: str):
     """Create a security scanning agent with all the necessary tools."""
+    # Create the Playwright MCP server
+    playwright_server = create_playwright_mcp_server()
+    
+
     return Agent(
         name="SecurityScanner",
         instructions=system_prompt,
-        tools=tools,
+        tools=base_tools,  # Base tools only - MCP tools are added via mcp_servers
+        mcp_servers=[playwright_server]  # Add MCP server directly
     )
 
 
@@ -925,9 +935,14 @@ async def run_continuously(
         # Create agent and run using the SDK
         agent = create_security_agent(system_prompt)
 
+        await agent.mcp_servers[0].connect()
+        mcp_tools = await agent.mcp_servers[0].list_tools()
+        logging.info(f"[main_agent] MCP tools: {[tool.name for tool in mcp_tools]}")
         # Log agent details
         logging.info(f"[main_agent] Created agent with {len(agent.tools)} tools")
         logging.info(f"[main_agent] Tools: {[tool.name for tool in agent.tools]}")
+
+        # Playwright MCP server will auto-start when first tool is called
 
         # Use the SDK's Runner to handle everything with hooks
         hooks = get_security_hooks(target_url)
@@ -967,6 +982,8 @@ async def run_continuously(
         if sandbox_instance and hasattr(sandbox_instance, "kill"):
             logging.info("[main_agent] Cleaning up sandbox instance")
             sandbox_instance.kill()
+
+        # Playwright MCP server cleanup is handled automatically
 
 
 async def run_single_target_scan(

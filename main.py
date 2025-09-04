@@ -233,7 +233,7 @@ def create_security_agent(system_prompt: str):
     return Agent(
         name="SecurityScanner",
         instructions=system_prompt,
-        tools=base_tools,  # Base tools only - MCP tools are added via mcp_servers
+        tools=tools,  # Base tools only - MCP tools are added via mcp_servers
         mcp_servers=[playwright_server]  # Add MCP server directly
     )
 

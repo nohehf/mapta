@@ -20,8 +20,8 @@ def create_playwright_mcp_server():
     """
     return MCPServerStdio(
         params={
-            "command": "docker",
-            "args": ["run", "-i", "--rm", "--init", "mcr.microsoft.com/playwright/mcp"]
+            "command": "npx",
+            "args": ["@playwright/mcp@latest"]
         },
         # Enable caching since tool list won't change
         cache_tools_list=True
